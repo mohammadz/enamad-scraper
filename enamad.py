@@ -67,6 +67,8 @@ SEARCH_URLS = (
     "http://enamad.ir/DomainListForMIMT",
 )
 DEFAULT_TIMEOUT = 60
+DEFAULT_RETRIES = 2
+DEFAULT_DELAY = 0.4
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -85,7 +87,7 @@ PROFILE_KEYS = (
     "history",
     "star",
 )
-OUTPUT_KEYS = ("domain",) + PROFILE_KEYS
+OUTPUT_KEYS = ("domain", "status") + PROFILE_KEYS + ("error",)
 POSITIONAL_KEYS = (
     "name",
     "start_date",
@@ -825,23 +827,46 @@ class Enamad:
         session: requests.Session | None = None,
         timeout: int = DEFAULT_TIMEOUT,
         cache: LookupCache | None = None,
+        retries: int = DEFAULT_RETRIES,
     ) -> None:
         self.domain = normalize_domain(domain)
         self.timeout = timeout
+        self.retries = max(0, retries)
         self.session = session or build_session()
         self.cache = cache or LookupCache()
         self._search_html = ""
         self._site_html = ""
         self._search_row_data = self._lookup()
 
+    def _send(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        kwargs.setdefault("timeout", self.timeout)
+        kwargs.setdefault("allow_redirects", True)
+        attempts = self.retries + 1
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                response = self.session.request(method, url, **kwargs)
+                if response.status_code >= 500 and attempt + 1 < attempts:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                return response
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt + 1 < attempts:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise EnamadError(
+                    f"اتصال به {urlparse(url).hostname} برقرار نشد: {exc}"
+                ) from exc
+        if last_error:
+            raise EnamadError(
+                f"اتصال به {urlparse(url).hostname} برقرار نشد: {last_error}"
+            ) from last_error
+        raise EnamadError(f"اتصال به {urlparse(url).hostname} برقرار نشد.")
+
     def _get(self, url: str, params: dict[str, str] | None = None) -> str:
+        response = self._send("GET", url, params=params)
         try:
-            response = self.session.get(
-                url,
-                params=params,
-                timeout=self.timeout,
-                allow_redirects=True,
-            )
             response.raise_for_status()
         except requests.RequestException as exc:
             raise EnamadError(f"اتصال به {urlparse(url).hostname} برقرار نشد: {exc}") from exc
@@ -945,14 +970,10 @@ class Enamad:
         for data in bodies:
             try:
                 if method.upper() == "GET":
-                    response = self.session.get(
-                        url, params=data, headers=headers, timeout=self.timeout
-                    )
+                    response = self._send("GET", url, params=data, headers=headers)
                 else:
-                    response = self.session.post(
-                        url, data=data, headers=headers, timeout=self.timeout
-                    )
-            except requests.RequestException as exc:
+                    response = self._send("POST", url, data=data, headers=headers)
+            except EnamadError as exc:
                 log.debug("home search error: %s", exc)
                 continue
             if response.status_code >= 400:
@@ -1078,7 +1099,7 @@ class Enamad:
                 pass
         if not any(data.get(key) for key in PROFILE_KEYS) and not profile_url:
             return None
-        return {"domain": self.domain, **data}
+        return {**data, "domain": self.domain, "status": "ok", "error": None}
 
     def _get_profile_html(self, url: str) -> str | None:
         candidates = []
@@ -1109,10 +1130,8 @@ class Enamad:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         }
         try:
-            response = self.session.get(
-                url, headers=headers, timeout=self.timeout, allow_redirects=True
-            )
-        except requests.RequestException as exc:
+            response = self._send("GET", url, headers=headers)
+        except EnamadError as exc:
             log.debug("profile fetch failed %s: %s", url, exc)
             return None
         response.encoding = response.apparent_encoding or "utf-8"
@@ -1169,6 +1188,41 @@ def collect_domains(values: list[str], file_path: str | None = None) -> list[str
     return domains
 
 
+def load_saved_rows(path: str) -> list[dict[str, Any]]:
+    file_path = Path(path)
+    if not file_path.exists() or file_path.stat().st_size == 0:
+        return []
+    suffix = file_path.suffix.lower()
+    if suffix == ".json":
+        try:
+            payload = json.loads(file_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        if isinstance(payload, dict):
+            return [payload] if payload.get("domain") else []
+        if isinstance(payload, list):
+            return [row for row in payload if isinstance(row, dict) and row.get("domain")]
+        return []
+    try:
+        with file_path.open(encoding="utf-8-sig", newline="") as handle:
+            return [row for row in csv.DictReader(handle) if row.get("domain")]
+    except OSError:
+        return []
+
+
+def load_done_domains(path: str) -> set[str]:
+    done: set[str] = set()
+    for row in load_saved_rows(path):
+        raw = str(row.get("domain") or "").strip()
+        if not raw:
+            continue
+        try:
+            done.add(normalize_domain(raw))
+        except EnamadError:
+            continue
+    return done
+
+
 def lookup_many(
     domains: list[str],
     session: requests.Session | None = None,
@@ -1182,7 +1236,14 @@ def lookup_many(
             client = Enamad(domain, session=session, timeout=timeout, cache=cache)
             data = client.get()
             if data is None:
-                rows.append({"domain": client.domain, **{key: None for key in PROFILE_KEYS}})
+                rows.append(
+                    {
+                        "domain": client.domain,
+                        "status": "missing",
+                        "error": None,
+                        **{key: None for key in PROFILE_KEYS},
+                    }
+                )
             else:
                 rows.append(data)
         except EnamadError as exc:
@@ -1190,8 +1251,9 @@ def lookup_many(
             rows.append(
                 {
                     "domain": normalize_domain(domain),
-                    **{key: None for key in PROFILE_KEYS},
+                    "status": "error",
                     "error": str(exc),
+                    **{key: None for key in PROFILE_KEYS},
                 }
             )
     return rows
@@ -1228,19 +1290,22 @@ def json_payload(
     check: bool,
     expired: bool,
     total: int | None = None,
+    as_list: bool = False,
 ) -> Any:
     count = total if total is not None else len(rows)
+    want_list = as_list or count != 1
     if check:
-        if count == 1:
-            return rows[0]["has_enamad"] if rows else None
-        return rows
+        if want_list:
+            return rows
+        return rows[0]["has_enamad"] if rows else None
     if expired:
-        if count == 1:
-            return rows[0]["expired"] if rows else None
-        return rows
-    if count == 1:
-        return {key: rows[0].get(key) for key in OUTPUT_KEYS} if rows else None
-    return [{key: row.get(key) for key in OUTPUT_KEYS} for row in rows]
+        if want_list:
+            return rows
+        return rows[0]["expired"] if rows else None
+    mapped = [{key: row.get(key) for key in OUTPUT_KEYS} for row in rows]
+    if want_list:
+        return mapped
+    return mapped[0] if mapped else None
 
 
 def _json_print(value: Any, dest: TextIO) -> None:
@@ -1250,21 +1315,45 @@ def _json_print(value: Any, dest: TextIO) -> None:
 
 def _lookup_row(client: Enamad, check: bool, expired: bool) -> dict[str, Any]:
     if check:
-        return {"domain": client.domain, "has_enamad": client.has_enamad()}
+        has_enamad = client.has_enamad()
+        return {
+            "domain": client.domain,
+            "has_enamad": has_enamad,
+            "status": "ok" if has_enamad else "missing",
+        }
     if expired:
-        return {"domain": client.domain, "expired": client.is_expired()}
+        expired_flag = client.is_expired()
+        return {
+            "domain": client.domain,
+            "expired": expired_flag,
+            "status": "missing" if expired_flag is None else "ok",
+        }
     data = client.get()
     if data is None:
-        return {"domain": client.domain, **{key: None for key in PROFILE_KEYS}}
+        return {
+            "domain": client.domain,
+            "status": "missing",
+            "error": None,
+            **{key: None for key in PROFILE_KEYS},
+        }
+    data.setdefault("status", "ok")
+    data.setdefault("error", None)
     return data
 
 
-def _error_row(domain: str, check: bool, expired: bool) -> dict[str, Any]:
+def _error_row(
+    domain: str, check: bool, expired: bool, message: str = ""
+) -> dict[str, Any]:
     if check:
-        return {"domain": domain, "has_enamad": False}
+        return {"domain": domain, "has_enamad": False, "status": "error", "error": message}
     if expired:
-        return {"domain": domain, "expired": None}
-    return {"domain": domain, **{key: None for key in PROFILE_KEYS}}
+        return {"domain": domain, "expired": None, "status": "error", "error": message}
+    return {
+        "domain": domain,
+        "status": "error",
+        "error": message,
+        **{key: None for key in PROFILE_KEYS},
+    }
 
 
 def _duration(seconds: float) -> str:
@@ -1396,19 +1485,25 @@ class ResultSink:
         check: bool,
         expired: bool,
         total: int,
+        resume: bool = False,
     ) -> None:
         self.dest_path = dest_path
         self.use_csv = use_csv
         self.check = check
         self.expired = expired
         self.total = total
+        self.as_list = total > 1
         self.rows: list[dict[str, Any]] = []
         self.fieldnames = _csv_fieldnames(check, expired)
         self._csv_file: TextIO | None = None
         self._csv_writer: Any = None
         self._owns_csv = False
+        if dest_path and resume and not use_csv:
+            self.rows = load_saved_rows(dest_path)
+            if self.rows:
+                self.as_list = True
         if dest_path and use_csv:
-            self._open_csv(dest_path)
+            self._open_csv(dest_path, append=resume)
             self._owns_csv = True
         elif use_csv:
             self._csv_file = sys.stdout
@@ -1436,7 +1531,13 @@ class ResultSink:
         if self.dest_path or self.use_csv:
             return
         _json_print(
-            json_payload(self.rows, self.check, self.expired, self.total),
+            json_payload(
+                self.rows,
+                self.check,
+                self.expired,
+                total=self.total,
+                as_list=self.as_list,
+            ),
             dest,
         )
 
@@ -1448,21 +1549,30 @@ class ResultSink:
             tmp = Path(self.dest_path).with_name(Path(self.dest_path).name + ".tmp")
             tmp.unlink(missing_ok=True)
 
-    def _open_csv(self, path: str) -> None:
-        self._csv_file = Path(path).open("w", encoding="utf-8-sig", newline="")
+    def _open_csv(self, path: str, append: bool = False) -> None:
+        exists = Path(path).exists() and Path(path).stat().st_size > 0
+        mode = "a" if append and exists else "w"
+        self._csv_file = Path(path).open(mode, encoding="utf-8-sig", newline="")
         self._csv_writer = csv.DictWriter(
             self._csv_file,
             fieldnames=list(self.fieldnames),
             extrasaction="ignore",
             lineterminator="\n",
         )
-        self._csv_writer.writeheader()
+        if not (append and exists):
+            self._csv_writer.writeheader()
         self._flush(self._csv_file)
 
     def _rewrite_json(self) -> None:
         assert self.dest_path is not None
         path = Path(self.dest_path)
-        payload = json_payload(self.rows, self.check, self.expired, self.total)
+        payload = json_payload(
+            self.rows,
+            self.check,
+            self.expired,
+            total=self.total,
+            as_list=self.as_list or len(self.rows) != 1,
+        )
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
@@ -1489,9 +1599,9 @@ def _configure_logging(debug: bool) -> None:
 
 def _csv_fieldnames(check: bool, expired: bool) -> tuple[str, ...]:
     if check:
-        return ("domain", "has_enamad")
+        return ("domain", "has_enamad", "status")
     if expired:
-        return ("domain", "expired")
+        return ("domain", "expired", "status")
     return OUTPUT_KEYS
 
 
@@ -1556,6 +1666,25 @@ def main(argv: list[str] | None = None) -> int:
         help="فقط منقضی بودن اینماد را چاپ می‌کند",
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="دامنه‌های موجود در فایل خروجی را رد می‌کند و ادامه می‌دهد",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=DEFAULT_RETRIES,
+        metavar="N",
+        help=f"تعداد تلاش مجدد برای خطای شبکه (پیش‌فرض {DEFAULT_RETRIES})",
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=DEFAULT_DELAY,
+        metavar="SEC",
+        help=f"فاصله بین استعلام دامنه‌ها به ثانیه (پیش‌فرض {DEFAULT_DELAY})",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="جزئیات جست‌وجو را در stderr چاپ می‌کند",
@@ -1567,6 +1696,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.csv is not None and args.json is not None:
         parser.error("فقط یکی از --csv یا --json را مشخص کنید")
 
+    if args.retries < 0:
+        parser.error("--retries نمی‌تواند منفی باشد")
+    if args.delay < 0:
+        parser.error("--delay نمی‌تواند منفی باشد")
+
     try:
         domains = collect_domains(args.domains, args.file)
     except (EnamadError, OSError) as exc:
@@ -1576,12 +1710,30 @@ def main(argv: list[str] | None = None) -> int:
     session = build_session()
     cache = LookupCache()
     use_csv, dest_path = _resolve_output(args.csv, args.json, args.output)
+    if args.resume and not dest_path:
+        parser.error("--resume فقط همراه با فایل خروجی (--csv / --json / -o) کار می‌کند")
+    skipped = 0
+    if args.resume and dest_path:
+        done = load_done_domains(dest_path)
+        if done:
+            remaining = [domain for domain in domains if domain not in done]
+            skipped = len(domains) - len(remaining)
+            domains = remaining
+            print(
+                f"{skipped} دامنه از قبل در فایل بود؛ ادامه با {len(domains)} دامنه",
+                file=sys.stderr,
+            )
+    if not domains:
+        print("همه دامنه‌ها از قبل در فایل خروجی هستند.", file=sys.stderr)
+        return 0
+
     sink = ResultSink(
         dest_path,
         use_csv=use_csv,
         check=args.check,
         expired=args.expired,
         total=len(domains),
+        resume=args.resume,
     )
     progress = ProgressReporter(len(domains), enabled=not args.debug)
     had_error = False
@@ -1590,14 +1742,21 @@ def main(argv: list[str] | None = None) -> int:
         for index, domain in enumerate(domains, start=1):
             progress.begin(index, domain)
             try:
-                client = Enamad(domain, session=session, cache=cache)
+                client = Enamad(
+                    domain,
+                    session=session,
+                    cache=cache,
+                    retries=args.retries,
+                )
                 sink.add(_lookup_row(client, args.check, args.expired))
                 progress.succeed()
             except EnamadError as exc:
                 had_error = True
                 log.error("%s: %s", domain, exc)
-                sink.add(_error_row(domain, args.check, args.expired))
+                sink.add(_error_row(domain, args.check, args.expired, str(exc)))
                 progress.fail()
+            if args.delay > 0 and index < len(domains):
+                time.sleep(args.delay)
         sink.finish_stdout(sys.stdout)
     except KeyboardInterrupt:
         stopped = True

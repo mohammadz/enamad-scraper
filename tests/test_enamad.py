@@ -10,10 +10,12 @@ import jdatetime
 from enamad import (
     OUTPUT_KEYS,
     ResultSink,
+    _error_row,
     collect_domains,
     discover_homepage_search,
     extract_trustseal_url,
     json_payload,
+    load_done_domains,
     normalize_domain,
     parse_jalali_date,
     parse_profile_page,
@@ -216,7 +218,7 @@ class CsvTests(unittest.TestCase):
         )
         lines = text.strip().split("\n")
         self.assertEqual(lines[0], ",".join(OUTPUT_KEYS))
-        self.assertTrue(lines[1].startswith("example.ir,12345,فروشگاه نمونه,"))
+        self.assertTrue(lines[1].startswith("example.ir,"))
 
 
 class ResultSinkTests(unittest.TestCase):
@@ -257,6 +259,44 @@ class ResultSinkTests(unittest.TestCase):
         )
         self.assertIsInstance(payload, dict)
         self.assertEqual(payload["domain"], "example.ir")
+
+
+class ResumeAndStatusTests(unittest.TestCase):
+    def test_load_done_domains_from_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "out.csv"
+            path.write_text("domain,status\nexample.ir,ok\nshop.ir,missing\n", encoding="utf-8")
+            self.assertEqual(load_done_domains(str(path)), {"example.ir", "shop.ir"})
+
+    def test_load_done_domains_from_json_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "out.json"
+            path.write_text(
+                json.dumps([{"domain": "example.ir"}, {"domain": "https://www.shop.ir"}]),
+                encoding="utf-8",
+            )
+            self.assertEqual(load_done_domains(str(path)), {"example.ir", "shop.ir"})
+
+    def test_csv_resume_appends_without_new_header(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "out.csv"
+            first = ResultSink(str(path), use_csv=True, check=False, expired=False, total=2)
+            first.add({"domain": "example.ir", "status": "ok", "id": 1})
+            first.close()
+            second = ResultSink(
+                str(path), use_csv=True, check=False, expired=False, total=1, resume=True
+            )
+            second.add({"domain": "shop.ir", "status": "ok", "id": 2})
+            second.close()
+            text = path.read_text(encoding="utf-8-sig")
+            self.assertEqual(text.count("domain,status"), 1)
+            self.assertIn("example.ir", text)
+            self.assertIn("shop.ir", text)
+
+    def test_error_row_has_status(self) -> None:
+        row = _error_row("example.ir", check=False, expired=False, message="timeout")
+        self.assertEqual(row["status"], "error")
+        self.assertEqual(row["error"], "timeout")
 
 
 if __name__ == "__main__":
