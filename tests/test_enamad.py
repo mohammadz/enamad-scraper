@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,9 +9,11 @@ import jdatetime
 
 from enamad import (
     OUTPUT_KEYS,
+    ResultSink,
     collect_domains,
     discover_homepage_search,
     extract_trustseal_url,
+    json_payload,
     normalize_domain,
     parse_jalali_date,
     parse_profile_page,
@@ -214,6 +217,46 @@ class CsvTests(unittest.TestCase):
         lines = text.strip().split("\n")
         self.assertEqual(lines[0], ",".join(OUTPUT_KEYS))
         self.assertTrue(lines[1].startswith("example.ir,12345,فروشگاه نمونه,"))
+
+
+class ResultSinkTests(unittest.TestCase):
+    def test_csv_file_updates_after_each_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "out.csv"
+            sink = ResultSink(str(path), use_csv=True, check=False, expired=False, total=2)
+            sink.add({"domain": "example.ir", "id": 1, "title": "الف"})
+            first = path.read_text(encoding="utf-8-sig")
+            self.assertIn("example.ir", first)
+            self.assertNotIn("shop.ir", first)
+            sink.add({"domain": "shop.ir", "id": 2, "title": "ب"})
+            second = path.read_text(encoding="utf-8-sig")
+            self.assertIn("shop.ir", second)
+            sink.close()
+
+    def test_json_file_stays_valid_after_each_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "out.json"
+            sink = ResultSink(str(path), use_csv=False, check=False, expired=False, total=2)
+            sink.add({"domain": "example.ir", "id": 1, "title": "الف"})
+            first = json.loads(path.read_text(encoding="utf-8"))
+            self.assertIsInstance(first, list)
+            self.assertEqual(len(first), 1)
+            self.assertEqual(first[0]["domain"], "example.ir")
+            sink.add({"domain": "shop.ir", "id": 2, "title": "ب"})
+            second = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(len(second), 2)
+            self.assertEqual(second[1]["domain"], "shop.ir")
+            sink.close()
+
+    def test_json_payload_single_object(self) -> None:
+        payload = json_payload(
+            [{"domain": "example.ir", "id": 1}],
+            check=False,
+            expired=False,
+            total=1,
+        )
+        self.assertIsInstance(payload, dict)
+        self.assertEqual(payload["domain"], "example.ir")
 
 
 if __name__ == "__main__":

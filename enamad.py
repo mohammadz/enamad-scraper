@@ -33,6 +33,8 @@ import logging
 import re
 import socket
 import ssl
+import threading
+import time
 from functools import cached_property
 from io import StringIO
 from typing import Any, TextIO
@@ -1214,14 +1216,267 @@ def write_csv(
     )
     writer.writeheader()
     for row in rows:
-        writer.writerow(
-            {key: "" if row.get(key) is None else row.get(key) for key in fieldnames}
-        )
+        writer.writerow(_csv_cells(row, fieldnames))
+
+
+def _csv_cells(row: dict[str, Any], fieldnames: tuple[str, ...] | list[str]) -> dict[str, Any]:
+    return {key: "" if row.get(key) is None else row.get(key) for key in fieldnames}
+
+
+def json_payload(
+    rows: list[dict[str, Any]],
+    check: bool,
+    expired: bool,
+    total: int | None = None,
+) -> Any:
+    count = total if total is not None else len(rows)
+    if check:
+        if count == 1:
+            return rows[0]["has_enamad"] if rows else None
+        return rows
+    if expired:
+        if count == 1:
+            return rows[0]["expired"] if rows else None
+        return rows
+    if count == 1:
+        return {key: rows[0].get(key) for key in OUTPUT_KEYS} if rows else None
+    return [{key: row.get(key) for key in OUTPUT_KEYS} for row in rows]
 
 
 def _json_print(value: Any, dest: TextIO) -> None:
     json.dump(value, dest, ensure_ascii=False, indent=2)
     dest.write("\n")
+
+
+def _lookup_row(client: Enamad, check: bool, expired: bool) -> dict[str, Any]:
+    if check:
+        return {"domain": client.domain, "has_enamad": client.has_enamad()}
+    if expired:
+        return {"domain": client.domain, "expired": client.is_expired()}
+    data = client.get()
+    if data is None:
+        return {"domain": client.domain, **{key: None for key in PROFILE_KEYS}}
+    return data
+
+
+def _error_row(domain: str, check: bool, expired: bool) -> dict[str, Any]:
+    if check:
+        return {"domain": domain, "has_enamad": False}
+    if expired:
+        return {"domain": domain, "expired": None}
+    return {"domain": domain, **{key: None for key in PROFILE_KEYS}}
+
+
+def _duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    minutes, secs = divmod(total, 60)
+    if minutes >= 60:
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+class ProgressReporter:
+    """Live progress on stderr so stdout stays clean JSON/CSV."""
+
+    def __init__(self, total: int, enabled: bool = True) -> None:
+        self.total = max(1, total)
+        self.enabled = enabled
+        self.tty = enabled and sys.stderr.isatty()
+        self._lock = threading.Lock()
+        self._index = 0
+        self._domain = ""
+        self._ok = 0
+        self._fail = 0
+        self._started = time.monotonic()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        if self.tty:
+            sys.stderr.write("\033[?25l")
+            sys.stderr.flush()
+            self._thread = threading.Thread(target=self._spin, daemon=True)
+            self._thread.start()
+
+    def begin(self, index: int, domain: str) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            self._index = index
+            self._domain = domain
+        if not self.tty:
+            print(
+                f"استعلام {index}/{self.total}  {domain}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def succeed(self) -> None:
+        with self._lock:
+            self._ok += 1
+
+    def fail(self) -> None:
+        with self._lock:
+            self._fail += 1
+
+    def close(self, stopped: bool = False, saved_to: str | None = None) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.3)
+        try:
+            if not self.enabled:
+                return
+            elapsed = _duration(time.monotonic() - self._started)
+            if stopped:
+                summary = f"متوقف شد  {self._ok}/{self.total}  ·  {elapsed}"
+                if saved_to:
+                    summary += f"\nذخیره شد: {saved_to}"
+                frame = "■"
+                done = False
+            elif self._fail:
+                summary = f"تمام شد  {self._ok} موفق  {self._fail} ناموفق  ·  {elapsed}"
+                frame = "✓"
+                done = True
+            else:
+                summary = f"تمام شد  {self._ok}/{self.total}  ·  {elapsed}"
+                frame = "✓"
+                done = True
+            if self.tty:
+                line = self._line(done=done, frame=frame)
+                self._write(f"\r{line}\n{summary}\n")
+            else:
+                print(summary, file=sys.stderr, flush=True)
+        finally:
+            if self.tty:
+                try:
+                    sys.stderr.write("\033[?25h")
+                    sys.stderr.flush()
+                except OSError:
+                    pass
+
+    def _spin(self) -> None:
+        frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        n = 0
+        while not self._stop.wait(0.08):
+            self._write("\r" + self._line(done=False, frame=frames[n % len(frames)]))
+            n += 1
+
+    def _line(self, done: bool, frame: str) -> str:
+        with self._lock:
+            index = self._index
+            domain = self._domain
+        width = 20
+        filled = width if done else int(width * max(index, 0) / self.total)
+        bar = "█" * filled + "░" * (width - filled)
+        percent = 100 if done else int(100 * max(index, 0) / self.total)
+        current = domain or "…"
+        text = f"{frame}  {index}/{self.total}  {bar}  {percent:3d}%  {current}"
+        try:
+            columns = os.get_terminal_size(sys.stderr.fileno()).columns
+        except OSError:
+            columns = 80
+        if len(text) > columns:
+            text = text[: max(0, columns - 1)] + "…"
+        return text.ljust(max(columns, len(text)))
+
+    def _write(self, text: str) -> None:
+        try:
+            sys.stderr.write(text)
+            sys.stderr.flush()
+        except OSError:
+            pass
+
+
+class ResultSink:
+    """Write results as they arrive. Files stay valid after every domain."""
+
+    def __init__(
+        self,
+        dest_path: str | None,
+        use_csv: bool,
+        check: bool,
+        expired: bool,
+        total: int,
+    ) -> None:
+        self.dest_path = dest_path
+        self.use_csv = use_csv
+        self.check = check
+        self.expired = expired
+        self.total = total
+        self.rows: list[dict[str, Any]] = []
+        self.fieldnames = _csv_fieldnames(check, expired)
+        self._csv_file: TextIO | None = None
+        self._csv_writer: Any = None
+        self._owns_csv = False
+        if dest_path and use_csv:
+            self._open_csv(dest_path)
+            self._owns_csv = True
+        elif use_csv:
+            self._csv_file = sys.stdout
+            self._csv_writer = csv.DictWriter(
+                self._csv_file,
+                fieldnames=list(self.fieldnames),
+                extrasaction="ignore",
+                lineterminator="\n",
+            )
+            self._csv_writer.writeheader()
+            self._csv_file.flush()
+
+    def add(self, row: dict[str, Any]) -> None:
+        self.rows.append(row)
+        if self.use_csv:
+            if self._csv_writer is None or self._csv_file is None:
+                return
+            self._csv_writer.writerow(_csv_cells(row, self.fieldnames))
+            self._flush(self._csv_file)
+            return
+        if self.dest_path:
+            self._rewrite_json()
+
+    def finish_stdout(self, dest: TextIO) -> None:
+        if self.dest_path or self.use_csv:
+            return
+        _json_print(
+            json_payload(self.rows, self.check, self.expired, self.total),
+            dest,
+        )
+
+    def close(self) -> None:
+        if self._owns_csv and self._csv_file is not None:
+            self._csv_file.close()
+            self._csv_file = None
+        if self.dest_path and not self.use_csv:
+            tmp = Path(self.dest_path).with_name(Path(self.dest_path).name + ".tmp")
+            tmp.unlink(missing_ok=True)
+
+    def _open_csv(self, path: str) -> None:
+        self._csv_file = Path(path).open("w", encoding="utf-8-sig", newline="")
+        self._csv_writer = csv.DictWriter(
+            self._csv_file,
+            fieldnames=list(self.fieldnames),
+            extrasaction="ignore",
+            lineterminator="\n",
+        )
+        self._csv_writer.writeheader()
+        self._flush(self._csv_file)
+
+    def _rewrite_json(self) -> None:
+        assert self.dest_path is not None
+        path = Path(self.dest_path)
+        payload = json_payload(self.rows, self.check, self.expired, self.total)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+
+    @staticmethod
+    def _flush(handle: TextIO) -> None:
+        handle.flush()
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            pass
 
 
 def _configure_logging(debug: bool) -> None:
@@ -1230,13 +1485,6 @@ def _configure_logging(debug: bool) -> None:
         format="%(levelname)s %(message)s",
         stream=sys.stderr,
     )
-
-
-def _open_output(path: str | None) -> tuple[TextIO, bool]:
-    if not path or path == "-":
-        return sys.stdout, False
-    encoding = "utf-8-sig" if path.lower().endswith(".csv") else "utf-8"
-    return Path(path).open("w", encoding=encoding, newline=""), True
 
 
 def _csv_fieldnames(check: bool, expired: bool) -> tuple[str, ...]:
@@ -1327,57 +1575,38 @@ def main(argv: list[str] | None = None) -> int:
 
     session = build_session()
     cache = LookupCache()
-    rows: list[dict[str, Any]] = []
-    had_error = False
-    for domain in domains:
-        try:
-            client = Enamad(domain, session=session, cache=cache)
-            if args.check:
-                rows.append({"domain": client.domain, "has_enamad": client.has_enamad()})
-            elif args.expired:
-                rows.append({"domain": client.domain, "expired": client.is_expired()})
-            else:
-                data = client.get()
-                if data is None:
-                    rows.append({"domain": client.domain, **{key: None for key in PROFILE_KEYS}})
-                else:
-                    rows.append(data)
-        except EnamadError as exc:
-            had_error = True
-            log.error("%s: %s", domain, exc)
-            if args.check:
-                rows.append({"domain": domain, "has_enamad": False})
-            elif args.expired:
-                rows.append({"domain": domain, "expired": None})
-            else:
-                rows.append({"domain": domain, **{key: None for key in PROFILE_KEYS}})
-
     use_csv, dest_path = _resolve_output(args.csv, args.json, args.output)
-
-    dest, should_close = _open_output(dest_path)
+    sink = ResultSink(
+        dest_path,
+        use_csv=use_csv,
+        check=args.check,
+        expired=args.expired,
+        total=len(domains),
+    )
+    progress = ProgressReporter(len(domains), enabled=not args.debug)
+    had_error = False
+    stopped = False
     try:
-        if use_csv:
-            write_csv(rows, dest, _csv_fieldnames(args.check, args.expired))
-        elif args.check and len(rows) == 1:
-            _json_print(rows[0]["has_enamad"], dest)
-        elif args.expired and len(rows) == 1:
-            _json_print(rows[0]["expired"], dest)
-        elif len(rows) == 1 and not args.check and not args.expired:
-            data = {key: rows[0].get(key) for key in OUTPUT_KEYS}
-            _json_print(data, dest)
-        else:
-            payload: Any
-            if args.check:
-                payload = rows
-            elif args.expired:
-                payload = rows
-            else:
-                payload = [{key: row.get(key) for key in OUTPUT_KEYS} for row in rows]
-            _json_print(payload, dest)
+        for index, domain in enumerate(domains, start=1):
+            progress.begin(index, domain)
+            try:
+                client = Enamad(domain, session=session, cache=cache)
+                sink.add(_lookup_row(client, args.check, args.expired))
+                progress.succeed()
+            except EnamadError as exc:
+                had_error = True
+                log.error("%s: %s", domain, exc)
+                sink.add(_error_row(domain, args.check, args.expired))
+                progress.fail()
+        sink.finish_stdout(sys.stdout)
+    except KeyboardInterrupt:
+        stopped = True
     finally:
-        if should_close:
-            dest.close()
+        sink.close()
+        progress.close(stopped=stopped, saved_to=dest_path)
 
+    if stopped:
+        return 130
     return 2 if had_error else 0
 
 
