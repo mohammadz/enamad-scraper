@@ -1,0 +1,11 @@
+<script>
+$("#BtnSearchDomain").click(function () {
+    var domain = $("#website_url").val();
+    $.ajax({
+        type: "POST",
+        url: "/Home/CheckEnamad",
+        data: { domain: domain },
+        success: function (response) {}
+    });
+});
+</script>
